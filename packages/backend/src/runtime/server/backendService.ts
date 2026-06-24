@@ -45,7 +45,7 @@ export class BackendService {
       ...query,
       ...(entity.publicFields ? { select: entity.publicFields } : {})
     })
-    return { ...result, data: result.data.map((record) => sanitizeOutput(entity, record)) }
+    return { ...result, data: result.data.map((record: Record<string, unknown>) => sanitizeOutput(entity, record)) }
   }
 
   async read(entityName: string, id: string, user: BackendUser | null): Promise<unknown> {
