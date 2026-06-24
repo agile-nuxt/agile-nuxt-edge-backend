@@ -9,3 +9,7 @@ coverage
 *.tgz
 .env
 .DS_Store
+
+# Keep edge-db source storage engine files tracked
+!packages/edge-db/src/storage/
+!packages/edge-db/src/storage/**
