@@ -1,0 +1,8 @@
+node_modules
+.nuxt
+.nuxt-*
+.output
+storage
+.env
+*.log
+.DS_Store

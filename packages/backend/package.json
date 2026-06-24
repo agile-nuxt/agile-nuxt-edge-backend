@@ -1,0 +1,86 @@
+{
+  "name": "@agile-nuxt/backend",
+  "version": "0.1.0",
+  "description": "A secure Nuxt and Nitro backend service module with CRUD, filters, optional auth, permissions, and field security.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Agile Nuxt contributors",
+  "homepage": "https://github.com/agile-nuxt/agile-nuxt-edge-backend#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agile-nuxt/agile-nuxt-edge-backend.git",
+    "directory": "packages/backend"
+  },
+  "bugs": {
+    "url": "https://github.com/agile-nuxt/agile-nuxt-edge-backend/issues"
+  },
+  "keywords": [
+    "nuxt",
+    "nuxt-module",
+    "nitro",
+    "backend",
+    "crud",
+    "auth",
+    "typescript",
+    "cpanel",
+    "fullstack"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./module": {
+      "types": "./dist/module.d.ts",
+      "import": "./dist/module.mjs",
+      "require": "./dist/module.cjs"
+    },
+    "./server": {
+      "types": "./dist/runtime/server/utils.d.ts",
+      "import": "./dist/runtime/server/utils.mjs",
+      "require": "./dist/runtime/server/utils.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src tests tsup.config.ts",
+    "pack:check": "tsx ../../scripts/check-package.ts --package backend --pack",
+    "clean": "rm -rf dist coverage"
+  },
+  "dependencies": {
+    "@agile-nuxt/edge-db": "workspace:*",
+    "h3": "^1.15.3",
+    "ofetch": "^1.4.1"
+  },
+  "peerDependencies": {
+    "nuxt": "^4.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "devDependencies": {
+    "@nuxt/kit": "^4.0.0",
+    "@nuxt/schema": "^4.0.0",
+    "@types/node": "^22.15.3",
+    "nuxt": "^4.0.0",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.2",
+    "vue": "^3.5.13"
+  }
+}

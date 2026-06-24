@@ -1,0 +1,63 @@
+name: Manual Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish versioned packages to npm
+        required: true
+        default: false
+        type: boolean
+      confirmation:
+        description: Type PUBLISH when publish is enabled
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+          cache: pnpm
+
+      - name: Install current npm CLI
+        run: npm install --global npm@latest
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check repository
+        run: pnpm repo:check
+
+      - name: Validate publish confirmation
+        if: ${{ inputs.publish && inputs.confirmation != 'PUBLISH' }}
+        run: |
+          echo "Set confirmation to PUBLISH to publish packages."
+          exit 1
+
+      - name: Publish packages
+        if: ${{ inputs.publish && inputs.confirmation == 'PUBLISH' }}
+        run: pnpm publish-packages
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"

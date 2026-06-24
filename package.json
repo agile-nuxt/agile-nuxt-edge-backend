@@ -1,0 +1,43 @@
+{
+  "name": "agile-nuxt-edge-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.12.1",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "workspaces": [
+    "packages/*",
+    "templates/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "build": "corepack pnpm -r --filter './packages/*' build",
+    "test": "corepack pnpm -r --filter './packages/*' test",
+    "typecheck": "corepack pnpm -r --filter './packages/*' typecheck",
+    "lint": "corepack pnpm -r --filter './packages/*' lint",
+    "clean": "corepack pnpm -r --filter './packages/*' clean && rm -rf node_modules",
+    "check:packages": "tsx scripts/check-package.ts",
+    "pack:check": "tsx scripts/check-package.ts --pack",
+    "publish:check": "corepack pnpm lint && corepack pnpm build && corepack pnpm test && corepack pnpm typecheck && corepack pnpm pack:check",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "publish-packages": "changeset publish",
+    "release": "corepack pnpm repo:check && corepack pnpm publish-packages",
+    "template:check": "tsx scripts/prepare-template.ts --check",
+    "repo:check": "tsx scripts/publish-local-check.ts"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.31.0",
+    "@eslint/js": "^9.39.0",
+    "@types/node": "^22.15.3",
+    "eslint": "^9.39.0",
+    "tsup": "^8.4.0",
+    "tsx": "^4.22.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.46.0",
+    "vitest": "^3.1.2"
+  }
+}

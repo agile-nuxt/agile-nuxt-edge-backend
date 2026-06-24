@@ -1,0 +1,11 @@
+node_modules
+dist
+.nuxt
+.output
+.edge-db
+storage
+coverage
+*.log
+*.tgz
+.env
+.DS_Store

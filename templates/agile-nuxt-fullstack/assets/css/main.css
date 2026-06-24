@@ -1,0 +1,114 @@
+:root {
+  --container-width: 1180px;
+  --color-page: #ffffff;
+  --color-text: #172126;
+  --color-muted: #607078;
+  --color-placeholder: #8a989e;
+  --color-border: #e3e9eb;
+  --color-border-strong: #ccd6da;
+  --color-subtle: #f5f8f8;
+  --color-accent: #16865f;
+  --color-accent-strong: #106c4d;
+  --color-danger: #b9483d;
+  --color-warning: #ca8a2d;
+  --color-focus: rgb(22 134 95 / 18%);
+  --shadow-soft: 0 10px 30px rgb(23 33 38 / 7%);
+  --shadow-medium: 0 20px 50px rgb(23 33 38 / 14%);
+  color: var(--color-text);
+  font-family: "Peyda", "Yekan Bakh", "IRANSansX", "Vazirmatn", Inter, system-ui, sans-serif;
+  font-synthesis: none;
+  background: var(--color-page);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  direction: ltr;
+  color-scheme: light;
+  scroll-behavior: smooth;
+}
+
+body {
+  min-inline-size: 320px;
+  margin: 0;
+  color: var(--color-text);
+  font-size: 14px;
+  background: var(--color-page);
+}
+
+button,
+input {
+  letter-spacing: 0;
+}
+
+a {
+  color: inherit;
+}
+
+.page-container {
+  inline-size: min(100% - 40px, var(--container-width));
+  margin-inline: auto;
+}
+
+.button {
+  min-block-size: 38px;
+  padding-inline: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  font-size: 13px;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.button--primary {
+  color: #ffffff;
+  background: var(--color-accent);
+}
+
+.button--primary:hover {
+  background: var(--color-accent-strong);
+}
+
+.button:focus-visible,
+.text-link:focus-visible {
+  outline: 3px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+.text-link {
+  color: var(--color-accent-strong);
+  font-size: 13px;
+  font-weight: 700;
+  text-underline-offset: 4px;
+}
+
+@media (max-width: 1024px) {
+  .page-container {
+    inline-size: min(100% - 32px, var(--container-width));
+  }
+}
+
+@media (max-width: 768px) {
+  body {
+    font-size: 13px;
+  }
+}
+
+@media (max-width: 560px) {
+  .page-container {
+    inline-size: min(100% - 24px, var(--container-width));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
