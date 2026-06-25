@@ -1,6 +1,10 @@
 import type {
   CollectionSchemaDefinition,
   DatabaseOptions,
+  InferCollection,
+  InferPublicCollection,
+  InferPublicCreate,
+  InferPublicUpdate,
   SchemaDefinition
 } from '@agile-nuxt/edge-db'
 
@@ -61,6 +65,13 @@ export interface BackendEntity extends CollectionSchemaDefinition {
   writableFields?: string[]
   permissions?: Partial<Record<BackendAction, PermissionRule>>
   hooks?: EntityHooks
+  includes?: string[]
+}
+
+export interface BackendCookieNames {
+  access?: string
+  refresh?: string
+  csrf?: string
 }
 
 export interface BackendAuthConfig {
@@ -73,6 +84,9 @@ export interface BackendAuthConfig {
   refreshTokenMaxAge?: string | number
   cookieMode?: boolean
   cookieSecure?: boolean
+  cookieDomain?: string
+  cookiePath?: string
+  cookieNames?: BackendCookieNames
   allowRegistration?: boolean
   loginRateLimit?: {
     maxAttempts?: number
@@ -80,22 +94,84 @@ export interface BackendAuthConfig {
   }
 }
 
-export interface BackendModuleOptions {
+export interface RateLimitConsumeOptions {
+  maxRequests: number
+  windowMs: number
+}
+
+export interface RateLimitDecision {
+  allowed: boolean
+  remaining: number
+  resetAt: number
+}
+
+export interface RateLimitAdapter {
+  readonly name: string
+  consume(
+    key: string,
+    options: RateLimitConsumeOptions
+  ): RateLimitDecision | Promise<RateLimitDecision>
+}
+
+export interface BackendRealtimeEvent {
+  type: 'entity.changed'
+  entity: string
+  id: string
+  operation: 'insert' | 'update' | 'delete' | 'restore'
+  timestamp: string
+}
+
+export interface BackendRealtimeAdapter {
+  readonly name: string
+  publish(event: BackendRealtimeEvent): void | Promise<void>
+  subscribe(
+    listener: (event: BackendRealtimeEvent) => void | Promise<void>
+  ): void | (() => void | Promise<void>) | Promise<void | (() => void | Promise<void>)>
+}
+
+export interface BackendConfig<
+  TEntities extends Record<string, BackendEntity> = Record<string, BackendEntity>
+> {
   routePrefix?: string
   auth?: false | BackendAuthConfig
   db: Omit<DatabaseOptions<SchemaDefinition>, 'schema'>
-  entities: Record<string, BackendEntity>
+  entities: TEntities
   security?: {
     maxBodySize?: number
     rateLimit?: {
       maxRequests?: number
       windowMs?: number
+      maxBuckets?: number
+      adapter?: RateLimitAdapter
     }
     diagnosticsEndpoint?: boolean
+    maxQueryStringSize?: number
+  }
+  websocket?: false | {
+    enabled?: boolean
+    path?: string
+    authRequired?: boolean
+    allowedEntities?: string[]
+    allowedOrigins?: string[]
+    maxSubscriptions?: number
+    adapter?: BackendRealtimeAdapter
   }
 }
 
-export interface ResolvedBackendConfig extends BackendModuleOptions {
+export type BackendModuleOptions<
+  TEntities extends Record<string, BackendEntity> = Record<string, BackendEntity>
+> =
+  | BackendConfig<TEntities>
+  | {
+      configFile: string
+      routePrefix?: string
+      websocket?: false | {
+        enabled?: boolean
+      path?: string
+      }
+    }
+
+export interface ResolvedBackendConfig extends BackendConfig {
   routePrefix: string
   auth: false | Required<
     Pick<
@@ -112,3 +188,25 @@ export interface ResolvedBackendConfig extends BackendModuleOptions {
   > &
     BackendAuthConfig
 }
+
+export type InferBackendEntities<TConfig extends BackendConfig> = TConfig['entities']
+
+export type InferBackendRecord<
+  TConfig extends BackendConfig,
+  TEntity extends keyof TConfig['entities']
+> = InferPublicCollection<TConfig['entities'][TEntity]>
+
+export type InferBackendInternalRecord<
+  TConfig extends BackendConfig,
+  TEntity extends keyof TConfig['entities']
+> = InferCollection<TConfig['entities'][TEntity]>
+
+export type InferBackendCreate<
+  TConfig extends BackendConfig,
+  TEntity extends keyof TConfig['entities']
+> = InferPublicCreate<TConfig['entities'][TEntity]>
+
+export type InferBackendUpdate<
+  TConfig extends BackendConfig,
+  TEntity extends keyof TConfig['entities']
+> = InferPublicUpdate<TConfig['entities'][TEntity]>

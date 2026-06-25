@@ -1,6 +1,6 @@
 {
   "name": "@agile-nuxt/backend",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A secure Nuxt and Nitro backend service module with CRUD, filters, optional auth, permissions, and field security.",
   "type": "module",
   "license": "MIT",
@@ -44,6 +44,11 @@
       "import": "./dist/module.mjs",
       "require": "./dist/module.cjs"
     },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "import": "./dist/config.mjs",
+      "require": "./dist/config.cjs"
+    },
     "./server": {
       "types": "./dist/runtime/server/utils.d.ts",
       "import": "./dist/runtime/server/utils.mjs",
@@ -72,7 +77,11 @@
   "publishConfig": {
     "access": "public"
   },
-  "sideEffects": false,
+  "sideEffects": [
+    "./src/nuxt.ts",
+    "./dist/index.mjs",
+    "./dist/index.cjs"
+  ],
   "devDependencies": {
     "@nuxt/kit": "^4.0.0",
     "@nuxt/schema": "^4.0.0",

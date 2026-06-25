@@ -18,10 +18,11 @@
     "@agile-nuxt/backend": "workspace:*",
     "@agile-nuxt/edge-db": "workspace:*",
     "nuxt": "^4.0.0",
-    "vue": "^3.5.38",
+    "vue": "3.5.38",
     "vue-router": "^5.1.0"
   },
   "devDependencies": {
+    "@types/node": "^22.15.3",
     "typescript": "^5.9.3",
     "vue-tsc": "^3.3.5"
   }

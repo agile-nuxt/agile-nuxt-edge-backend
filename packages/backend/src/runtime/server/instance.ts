@@ -1,6 +1,6 @@
 import configSource from '#agile-backend-config'
 import { createBackendRuntime, type BackendRuntime } from './factory.js'
-import type { BackendModuleOptions } from '../types.js'
+import type { BackendConfig } from '../types.js'
 
 interface BackendRuntimeState {
   runtimePromise: Promise<BackendRuntime> | undefined
@@ -16,7 +16,7 @@ function getRuntimeState(): BackendRuntimeState {
 
 export function getBackendRuntime(): Promise<BackendRuntime> {
   const state = getRuntimeState()
-  state.runtimePromise ??= createBackendRuntime(configSource as BackendModuleOptions).catch((error) => {
+  state.runtimePromise ??= createBackendRuntime(configSource as BackendConfig).catch((error) => {
     state.runtimePromise = undefined
     throw error
   })
@@ -28,6 +28,7 @@ export async function closeBackendRuntime(): Promise<void> {
   if (!state.runtimePromise) return
   const runtime = await state.runtimePromise
   await runtime.db.close()
+  await runtime.realtime.close()
   state.runtimePromise = undefined
 }
 

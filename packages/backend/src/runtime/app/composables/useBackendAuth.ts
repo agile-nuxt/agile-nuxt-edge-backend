@@ -36,6 +36,14 @@ export function useBackendAuth(baseURL = '/api/auth') {
         body: refreshToken ? { refreshToken } : {}
       })
       user.value = null
+    },
+    async logoutAll() {
+      const result = await api<{ ok: true; revoked: number }>('/logout-all', {
+        method: 'POST',
+        body: {}
+      })
+      user.value = null
+      return result
     }
   }
 }

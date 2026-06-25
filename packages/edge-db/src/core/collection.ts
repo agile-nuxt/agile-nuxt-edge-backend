@@ -6,6 +6,7 @@ import { matchesWhere, validateWhere } from '../query/filters.js'
 import { projectRecord } from '../query/projection.js'
 import type {
   FindQuery,
+  IncludeQuery,
   NormalizedCollectionSchema,
   QueryPlan,
   QueryResult,
@@ -22,6 +23,11 @@ export interface CollectionState {
 export type OperationExecutor = (operations: WriteOperation[]) => Promise<boolean>
 export type DeleteGuard = (collection: string, id: string) => void
 export type QueryObserver = (plan: QueryPlan) => void
+export type IncludeResolver = (
+  collection: string,
+  records: Record<string, unknown>[],
+  include: IncludeQuery
+) => Promise<Record<string, unknown>[]>
 
 function validateFieldValue(field: string, value: unknown, type: string, nullable: boolean): void {
   if (value === null) {
@@ -39,7 +45,11 @@ function validateFieldValue(field: string, value: unknown, type: string, nullabl
   }
 }
 
-export class Collection<TRecord extends Record<string, unknown> = Record<string, unknown>> {
+export class Collection<
+  TRecord extends Record<string, unknown> = Record<string, unknown>,
+  TCreate extends object = Partial<TRecord>,
+  TUpdate extends object = Partial<TRecord>
+> {
   constructor(
     readonly name: string,
     readonly schema: NormalizedCollectionSchema,
@@ -48,7 +58,8 @@ export class Collection<TRecord extends Record<string, unknown> = Record<string,
     private readonly execute: OperationExecutor,
     private readonly deleteGuard: DeleteGuard,
     private readonly logger: Logger,
-    private readonly observeQuery?: QueryObserver
+    private readonly observeQuery?: QueryObserver,
+    private readonly resolveIncludes?: IncludeResolver
   ) {}
 
   private normalizeInput(
@@ -105,8 +116,8 @@ export class Collection<TRecord extends Record<string, unknown> = Record<string,
     }
   }
 
-  async create(data: Partial<TRecord>): Promise<TRecord> {
-    const record = this.normalizeInput(data, 'create')
+  async create(data: TCreate): Promise<TRecord> {
+    const record = this.normalizeInput(data as Record<string, unknown>, 'create')
     this.state.indexes.assertUnique(record)
     const operation: WriteOperation = {
       collection: this.name,
@@ -119,8 +130,10 @@ export class Collection<TRecord extends Record<string, unknown> = Record<string,
     return projectRecord(record, this.schema) as TRecord
   }
 
-  async createMany(rows: Array<Partial<TRecord>>): Promise<TRecord[]> {
-    const records = rows.map((row) => this.normalizeInput(row, 'create'))
+  async createMany(rows: TCreate[]): Promise<TRecord[]> {
+    const records = rows.map((row) =>
+      this.normalizeInput(row as Record<string, unknown>, 'create')
+    )
     const clone = new Map(this.state.records)
     const indexes = new IndexRegistry(this.schema, clone)
     for (const record of records) {
@@ -152,18 +165,22 @@ export class Collection<TRecord extends Record<string, unknown> = Record<string,
     return record ? (structuredClone(record) as TRecord) : null
   }
 
-  async findFirst(query: FindQuery = {}): Promise<TRecord | null> {
+  async findFirst(query: FindQuery<TRecord> = {}): Promise<TRecord | null> {
     const result = await this.findMany({ ...query, limit: 1 })
     return result.data[0] ?? null
   }
 
-  async findFirstInternal(query: FindQuery = {}): Promise<TRecord | null> {
-    const result = await this.findMany({ ...query, limit: 1, select: ['id'] })
+  async findFirstInternal(query: FindQuery<TRecord> = {}): Promise<TRecord | null> {
+    const result = await this.findMany({
+      ...query,
+      limit: 1,
+      select: ['id'] as Array<Extract<keyof TRecord, string>>
+    })
     const id = result.data[0]?.id
     return id ? this.findByIdInternal(String(id)) : null
   }
 
-  async findMany(query: FindQuery = {}): Promise<QueryResult<TRecord>> {
+  async findMany(query: FindQuery<TRecord> = {}): Promise<QueryResult<TRecord>> {
     const started = performance.now()
     const where = query.where ?? {}
     validateWhere(where, this.schema, this.config.maxInFilterItems)
@@ -264,14 +281,22 @@ export class Collection<TRecord extends Record<string, unknown> = Record<string,
     }
     this.observeQuery?.(plan)
 
+    const projected = page.map((record) =>
+      projectRecord(record, this.schema, query.select as string[] | undefined)
+    )
+    const data =
+      query.include && this.resolveIncludes
+        ? await this.resolveIncludes(this.name, projected, query.include)
+        : projected
+
     return {
-      data: page.map((record) => projectRecord(record, this.schema, query.select) as TRecord),
+      data: data as TRecord[],
       ...(records.length > limit ? { nextCursor: String(page.at(-1)?.id) } : {}),
       ...(query.debug || this.config.debug ? { plan } : {})
     }
   }
 
-  async count(query: Omit<FindQuery, 'limit' | 'cursor' | 'select'> = {}): Promise<number> {
+  async count(query: Omit<FindQuery<TRecord>, 'limit' | 'cursor' | 'select'> = {}): Promise<number> {
     const result = await this.findMany({ ...query, limit: this.config.maxLimit })
     if (result.nextCursor) {
       let count = result.data.length
@@ -286,14 +311,14 @@ export class Collection<TRecord extends Record<string, unknown> = Record<string,
     return result.data.length
   }
 
-  async exists(query: FindQuery): Promise<boolean> {
+  async exists(query: FindQuery<TRecord>): Promise<boolean> {
     return Boolean(await this.findFirst(query))
   }
 
-  async update(id: string, patch: Partial<TRecord>): Promise<TRecord> {
+  async update(id: string, patch: TUpdate): Promise<TRecord> {
     const current = this.state.records.get(id)
     if (!current) throw new EdgeDbError('VALIDATION_FAILED', `Record "${this.name}.${id}" not found.`)
-    const normalized = this.normalizeInput(patch, 'update')
+    const normalized = this.normalizeInput(patch as Record<string, unknown>, 'update')
     if ('id' in normalized && normalized.id !== id) {
       throw new EdgeDbError('VALIDATION_FAILED', 'Record id cannot be changed.')
     }
@@ -310,11 +335,15 @@ export class Collection<TRecord extends Record<string, unknown> = Record<string,
     return projectRecord(next, this.schema) as TRecord
   }
 
-  async updateMany(query: FindQuery, patch: Partial<TRecord>): Promise<number> {
-    const matches = await this.findMany({ ...query, limit: this.config.maxLimit, select: ['id'] })
+  async updateMany(query: FindQuery<TRecord>, patch: TUpdate): Promise<number> {
+    const matches = await this.findMany({
+      ...query,
+      limit: this.config.maxLimit,
+      select: ['id'] as Array<Extract<keyof TRecord, string>>
+    })
     const operations = matches.data.map((record) => {
       const id = String(record.id)
-      const normalized = this.normalizeInput(patch, 'update')
+      const normalized = this.normalizeInput(patch as Record<string, unknown>, 'update')
       return { collection: this.name, op: 'update' as const, id, patch: normalized }
     })
     const applied = await this.execute(operations)
@@ -335,8 +364,12 @@ export class Collection<TRecord extends Record<string, unknown> = Record<string,
     if (!applied) this.applyLocal(operation)
   }
 
-  async deleteMany(query: FindQuery): Promise<number> {
-    const matches = await this.findMany({ ...query, limit: this.config.maxLimit, select: ['id'] })
+  async deleteMany(query: FindQuery<TRecord>): Promise<number> {
+    const matches = await this.findMany({
+      ...query,
+      limit: this.config.maxLimit,
+      select: ['id'] as Array<Extract<keyof TRecord, string>>
+    })
     for (const record of matches.data) this.deleteGuard(this.name, String(record.id))
     const operations = matches.data.map(
       (record): WriteOperation => ({ collection: this.name, op: 'delete', id: String(record.id) })
@@ -350,7 +383,7 @@ export class Collection<TRecord extends Record<string, unknown> = Record<string,
     if (!this.schema.softDelete || !this.schema.fields.deletedAt) {
       throw new EdgeDbError('VALIDATION_FAILED', `Collection "${this.name}" does not support soft delete.`)
     }
-    await this.update(id, { deletedAt: new Date().toISOString() } as unknown as Partial<TRecord>)
+    await this.update(id, { deletedAt: new Date().toISOString() } as unknown as TUpdate)
   }
 
   async restore(id: string): Promise<TRecord> {
@@ -362,8 +395,10 @@ export class Collection<TRecord extends Record<string, unknown> = Record<string,
     return projectRecord({ ...current, deletedAt: null }, this.schema) as TRecord
   }
 
-  async upsert(where: Where, data: Partial<TRecord>): Promise<TRecord> {
+  async upsert(where: Where<TRecord>, data: TCreate | TUpdate): Promise<TRecord> {
     const existing = await this.findFirst({ where, withDeleted: true })
-    return existing ? this.update(String(existing.id), data) : this.create(data)
+    return existing
+      ? this.update(String(existing.id), data as TUpdate)
+      : this.create(data as TCreate)
   }
 }

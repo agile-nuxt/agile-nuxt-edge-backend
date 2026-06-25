@@ -1,7 +1,7 @@
 import { assertStrongSecret } from './auth/jwt.js'
-import type { BackendModuleOptions, ResolvedBackendConfig } from '../types.js'
+import type { BackendConfig, ResolvedBackendConfig } from '../types.js'
 
-export function resolveBackendConfig(options: BackendModuleOptions): ResolvedBackendConfig {
+export function resolveBackendConfig(options: BackendConfig): ResolvedBackendConfig {
   const auth =
     options.auth === false || options.auth === undefined
       ? false
@@ -12,6 +12,12 @@ export function resolveBackendConfig(options: BackendModuleOptions): ResolvedBac
           userEntity: options.auth.userEntity ?? 'users',
           cookieMode: options.auth.cookieMode ?? true,
           cookieSecure: options.auth.cookieSecure ?? process.env.NODE_ENV === 'production',
+          cookiePath: options.auth.cookiePath ?? '/',
+          cookieNames: {
+            access: options.auth.cookieNames?.access ?? 'edge_access',
+            refresh: options.auth.cookieNames?.refresh ?? 'edge_refresh',
+            csrf: options.auth.cookieNames?.csrf ?? 'edge_csrf'
+          },
           allowRegistration: options.auth.allowRegistration ?? false
         }
   if (auth) {

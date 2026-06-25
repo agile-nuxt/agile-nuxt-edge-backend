@@ -1,6 +1,6 @@
 {
   "name": "@agile-nuxt/edge-db",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A zero-setup pure TypeScript embedded database for Nuxt and Nitro apps, optimized for fast indexed CRUD.",
   "type": "module",
   "license": "MIT",

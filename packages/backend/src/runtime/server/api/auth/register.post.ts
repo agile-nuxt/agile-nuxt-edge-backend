@@ -10,7 +10,10 @@ export default defineEventHandler(async (event) => {
   const auth = runtime.config.auth
   if (!auth) throw apiError(404, 'Auth is disabled.')
   if (!auth.allowRegistration) throw apiError(403, 'Registration is disabled.')
-  runtime.loginRateLimiter.assertAllowed(`register:${getRequestIP(event, { xForwardedFor: true }) ?? 'unknown'}`)
+  await runtime.loginRateLimiter.assertAllowed(
+    `register:${getRequestIP(event, { xForwardedFor: true }) ?? 'unknown'}`,
+    event
+  )
   const body = await readLimitedBody<Record<string, unknown> & { email?: string; password?: string }>(
     event,
     runtime

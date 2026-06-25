@@ -5,6 +5,9 @@
 A copyable Nuxt 4 starter using `@agile-nuxt/edge-db` and
 `@agile-nuxt/backend` together.
 
+Package release target: `@agile-nuxt/edge-db@0.2.0` and
+`@agile-nuxt/backend@0.2.0`.
+
 ## Included
 
 - English LTR responsive application shell.
@@ -13,13 +16,14 @@ A copyable Nuxt 4 starter using `@agile-nuxt/edge-db` and
 - Optional auth-ready login form.
 - Node server deployment preset.
 - Health endpoint at `/api/health`.
+- Permission-checked WebSocket change events at `/api/backend/ws`.
 
 ## Requirements
 
 - Node.js 20 or newer.
 - pnpm 9 or newer.
 - A writable persistent filesystem.
-- One writable Node process per database path.
+- One active writer per database path.
 
 ## Install and run
 
@@ -43,14 +47,14 @@ Open `http://localhost:3000`.
 
 1. Add a schema-defined users entity with `email`, private `passwordHash`, `role`,
    and `isActive` fields.
-2. Replace `auth: false` in `nuxt.config.ts` with the commented JWT configuration.
+2. Replace `auth: false` in `server/backend.config.ts` with JWT configuration.
 3. Set separate secrets of at least 32 random bytes in `.env`.
 4. Change `authEnabled` in `pages/login.vue` to `true`.
 5. Replace public write permissions with role or policy rules.
 
 ## Add an entity
 
-Add the entity under `backend.entities` in `nuxt.config.ts`, explicitly set
+Add the entity under `entities` in `server/backend.config.ts`, explicitly set
 `api: true`, define indexes, and grant only the permissions the public API needs.
 
 ```ts
@@ -88,8 +92,10 @@ deployments should use an absolute path managed independently from application r
 
 ## Limitations
 
-Version 1 is not for multi-server writes, ephemeral serverless filesystems,
-analytical workloads, arbitrary SQL, or PostgreSQL-style joins.
+Version 0.2 is not for simultaneous multi-writer operation, ephemeral serverless
+filesystems, analytical workloads, arbitrary SQL, or PostgreSQL-style joins.
+Multi-server deployments require a strong external writer lease, shared durable
+storage, and a realtime adapter for cross-server WebSocket delivery.
 
 See the [root documentation](../../README.md) for storage safety, auth, backup,
 recovery, diagnostics, and production limitations.

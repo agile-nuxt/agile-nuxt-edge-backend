@@ -9,7 +9,8 @@ const commands: Array<[string, string[]]> = [
   ['corepack', ['pnpm', 'test']],
   ['corepack', ['pnpm', 'typecheck']],
   ['corepack', ['pnpm', 'pack:check']],
-  ['corepack', ['pnpm', 'template:check']]
+  ['corepack', ['pnpm', 'template:check']],
+  ['corepack', ['pnpm', 'test:packed']]
 ]
 
 for (const [command, args] of commands) {

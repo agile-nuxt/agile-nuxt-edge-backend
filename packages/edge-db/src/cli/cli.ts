@@ -5,6 +5,7 @@ import { readOption } from './commands/common.js'
 import { compact, exportData, importData, inspect } from './commands/databaseCommand.js'
 import { doctor } from './commands/doctor.js'
 import { restore } from './commands/restore.js'
+import { schemaDiff } from './commands/schema.js'
 
 const [, , command, ...args] = process.argv
 const path = resolve(readOption(args, 'path', process.env.EDGE_DB_PATH ?? './storage/edge-db')!)
@@ -13,8 +14,14 @@ async function main(): Promise<void> {
   let result: unknown
   switch (command) {
     case 'doctor':
-      result = await doctor(path)
+      result = await doctor(path, args.includes('--repair'))
       break
+    case 'schema': {
+      if (args[0] !== 'diff') throw new Error('Usage: edge-db schema diff [--schema <schema.json>]')
+      const schemaPath = readOption(args, 'schema')
+      result = await schemaDiff(path, schemaPath ? resolve(schemaPath) : undefined)
+      break
+    }
     case 'inspect':
       result = await inspect(path)
       break
@@ -50,7 +57,7 @@ async function main(): Promise<void> {
       break
     default:
       throw new Error(
-        'Usage: edge-db <doctor|inspect|backup|restore|compact|export|import|benchmark> [options]'
+        'Usage: edge-db <doctor|schema|inspect|backup|restore|compact|export|import|benchmark> [options]'
       )
   }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)

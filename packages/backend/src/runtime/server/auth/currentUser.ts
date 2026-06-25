@@ -2,16 +2,14 @@ import { getCookie, getHeader, type H3Event } from 'h3'
 import { verifyAccessToken } from './jwt.js'
 import type { BackendRuntime } from '../instance.js'
 import type { BackendUser } from '../../types.js'
+import { authCookieNames } from './http.js'
 
-export async function getCurrentUserFromRuntime(
-  event: H3Event,
+export async function getUserFromAccessToken(
+  token: string | undefined,
   runtime: BackendRuntime
 ): Promise<BackendUser | null> {
   const auth = runtime.config.auth
-  if (!auth) return null
-  const bearer = getHeader(event, 'authorization')?.match(/^Bearer\s+(.+)$/i)?.[1]
-  const token = bearer ?? getCookie(event, 'edge_access')
-  if (!token) return null
+  if (!auth || !token) return null
   try {
     const payload = verifyAccessToken(token, auth.accessTokenSecret)
     const record = await runtime.db.collection(auth.userEntity).findById(payload.sub)
@@ -20,4 +18,15 @@ export async function getCurrentUserFromRuntime(
   } catch {
     return null
   }
+}
+
+export async function getCurrentUserFromRuntime(
+  event: H3Event,
+  runtime: BackendRuntime
+): Promise<BackendUser | null> {
+  const auth = runtime.config.auth
+  if (!auth) return null
+  const bearer = getHeader(event, 'authorization')?.match(/^Bearer\s+(.+)$/i)?.[1]
+  const token = bearer ?? getCookie(event, authCookieNames(runtime).access)
+  return getUserFromAccessToken(token, runtime)
 }

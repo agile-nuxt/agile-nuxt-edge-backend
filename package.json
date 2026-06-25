@@ -1,6 +1,6 @@
 {
   "name": "agile-nuxt-edge-backend",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.12.1",
@@ -27,6 +27,7 @@
     "publish-packages": "changeset publish",
     "release": "corepack pnpm repo:check && corepack pnpm publish-packages",
     "template:check": "tsx scripts/prepare-template.ts --check",
+    "test:packed": "tsx scripts/test-packed-fixture.ts",
     "repo:check": "tsx scripts/publish-local-check.ts"
   },
   "devDependencies": {

@@ -5,6 +5,7 @@ export interface StoragePaths {
   manifest: string
   lock: string
   journal: string
+  migration: string
   collections: string
   archive: string
   collection: (name: string) => CollectionPaths
@@ -30,6 +31,7 @@ export function createStoragePaths(input: string): StoragePaths {
     manifest: join(root, 'manifest.json'),
     lock: join(root, 'lock'),
     journal: join(root, 'journal.ndjson'),
+    migration: join(root, 'migration.json'),
     collections: join(root, 'collections'),
     archive: join(root, 'archive'),
     collection(name) {

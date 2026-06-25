@@ -3,6 +3,8 @@
 A secure Nuxt 4 and Nitro backend service module powered by
 `@agile-nuxt/edge-db`.
 
+Current release: `0.2.0`.
+
 ## Installation
 
 ```bash
@@ -12,21 +14,35 @@ pnpm add @agile-nuxt/edge-db @agile-nuxt/backend
 ## Nuxt Setup
 
 ```ts
+// server/backend.config.ts
+import { defineBackendConfig } from '@agile-nuxt/backend/config'
+
+export default defineBackendConfig({
+  auth: false,
+  db: {
+    path: process.env.EDGE_DB_PATH || './storage/edge-db'
+  },
+  entities: {}
+})
+```
+
+```ts
+// nuxt.config.ts
 export default defineNuxtConfig({
   modules: ['@agile-nuxt/backend'],
   nitro: { preset: 'node-server' },
   backend: {
-    auth: false,
-    db: {
-      path: process.env.EDGE_DB_PATH || './storage/edge-db'
-    },
-    entities: {}
+    configFile: './server/backend.config.ts'
   }
 })
 ```
 
 Writable deployments require a persistent filesystem and one writable Node
 process per database path.
+
+Inline serializable configuration remains supported. Hooks and adapters belong in
+the server config file; functions in `nuxt.config.ts` are rejected rather than
+serialized with `Function.toString()`.
 
 ## Auth Disabled Mode
 
@@ -59,8 +75,8 @@ backend: {
 }
 ```
 
-Auth routes are not registered. Permissions are still enforced, and unspecified
-actions default to disabled.
+Auth endpoints return `404` when auth is disabled. Permissions are still enforced,
+and unspecified actions default to disabled.
 
 ## Auth Enabled Mode
 
@@ -109,6 +125,9 @@ Secrets shorter than 32 bytes are rejected. Passwords use Node `scrypt`. Refresh
 tokens are opaque, hashed at rest, revoked on use, and rotated. Cookie mode uses
 HTTP-only, `SameSite=Strict` cookies plus CSRF validation.
 
+Refresh tokens form revocable families. Reuse of a rotated token revokes the
+entire family. Cookie names, domain, and path are configurable.
+
 ## Entity Configuration
 
 - `fields`: schema whitelist and field metadata.
@@ -141,6 +160,7 @@ When auth is enabled:
 - `POST /api/auth/login`
 - `POST /api/auth/refresh`
 - `POST /api/auth/logout`
+- `POST /api/auth/logout-all`
 - `GET /api/auth/me`
 
 The diagnostics endpoint is registered only when explicitly enabled and requires
@@ -174,6 +194,8 @@ Record-level read, update, delete, and restore policies run after lookup.
 - Private fields are never returned by normal API reads.
 - Private and non-writable fields are rejected on public writes.
 - Body size, query size, `in` filters, and request rates are bounded.
+- Bodies are bounded while streaming; malformed JSON and encoded query filters
+  return stable `400` responses.
 
 ## Hooks
 
@@ -216,6 +238,51 @@ await auth.me()
 await auth.logout()
 ```
 
+For end-to-end inference:
+
+```ts
+import type backendConfig from '~/server/backend.config'
+
+const backend = createBackendClient<typeof backendConfig>()
+const products = backend.entity('products')
+```
+
+Entity names, filters, create/update inputs, and public records are inferred.
+Private fields are excluded from public client input and output types.
+
+## WebSockets
+
+```ts
+websocket: {
+  enabled: true,
+  allowedEntities: ['products'],
+  allowedOrigins: ['https://app.example.com'],
+  maxSubscriptions: 20,
+  adapter: redisRealtimeAdapter
+}
+```
+
+Connect to `/api/backend/ws` and send
+`{"type":"subscribe","entity":"products"}`. Authorized clients receive
+metadata-only `entity.changed` messages and refetch through normal HTTP routes.
+Cookie or bearer authentication, origin validation, entity permissions, message
+limits, and subscription limits apply. `useBackendRealtime()` provides the browser
+client. A realtime adapter can distribute events across backend servers.
+
+## Permission-Safe Includes
+
+Relation names must be explicitly listed on the source entity:
+
+```ts
+posts: {
+  // fields and relations...
+  includes: ['author']
+}
+```
+
+Every included target record is checked against its own `read` permission and
+`publicFields`. Arbitrary and recursive joins remain unsupported.
+
 ## Server Utilities
 
 For domain workflows that do not fit generic CRUD:
@@ -237,13 +304,16 @@ export default defineBackendHandler(async (event) => {
 })
 ```
 
-Also available: `getCurrentUser` and `requirePermission`.
+Also available: `getCurrentUser`, `requirePermission`, and
+`publishBackendEvent`.
 
 ## Deployment
 
 - Use Nitro's `node-server` preset.
 - Use a writable persistent path outside `.output`.
-- Run one writable Node process per database path.
+- Run one writable process by default, or configure a strong external
+  `DatabaseCoordinator` for one active writer across servers on shared storage.
+- Configure a realtime adapter when WebSocket clients connect to multiple servers.
 - Use strong, separate auth secrets and HTTPS.
 - Run `edge-db doctor` under the production Node user.
 - Use `edge-db backup`; never copy live storage during writes.
@@ -258,6 +328,9 @@ Main exports:
 - `hashPassword` and `verifyPassword`
 - `signAccessToken` and `verifyAccessToken`
 - `RateLimiter`
+- `InMemoryRateLimitAdapter`
+- `defineBackendConfig`
+- `createBackendClient`
 - backend entity, auth, user, permission, hook, and module option types
 
 Server export:
@@ -267,12 +340,14 @@ Server export:
 - `requireAuth`
 - `requirePermission`
 - `defineBackendHandler`
+- `publishBackendEvent`
 
 ## Limitations
 
-Version 1 is for single-server Nuxt/Nitro applications. It is not a multi-server
-write system, distributed database, analytical engine, arbitrary SQL interface,
-or PostgreSQL-style relational query layer.
+Version 0.2 supports multi-server adaptation through external writer-lease and
+realtime adapters. It remains a single-active-writer filesystem database, not a
+simultaneous multi-writer or distributed consensus database, analytical engine,
+arbitrary SQL interface, or PostgreSQL-style relational query layer.
 
 See the [root documentation](../../README.md) and the private
 [fullstack quickstart](../../templates/agile-nuxt-fullstack).

@@ -7,6 +7,8 @@
 
 > A zero-setup, pure TypeScript embedded database and secure backend service for Nuxt/Nitro apps.
 
+Current package release: `0.2.0`.
+
 This monorepo contains two packages:
 
 - `@agile-nuxt/edge-db`: an embedded, schema-driven document database with append-only logs, indexes, transactions, snapshots, recovery, compaction, diagnostics, and backups.
@@ -45,24 +47,30 @@ The packages are separate so `edge-db` can be used without HTTP or Nuxt, while `
 
 ## What It Is Not
 
-Version 1 is not:
+Version 0.2 is not:
 
 - a PostgreSQL replacement or SQL database;
-- a multi-server or distributed write system;
+- a simultaneous multi-writer or distributed consensus system;
 - suitable for serverless or edge runtimes with ephemeral filesystems;
 - an analytical/OLAP database;
 - a PostgreSQL-style relational query or arbitrary join engine.
 
-Relations are metadata helpers (`belongsTo`, `hasMany`) plus optional `ref` fields. V1 enforces `onDelete: restrict`; arbitrary joins and automatic includes are intentionally not implemented.
+Relations are metadata helpers (`belongsTo`, `hasMany`) plus optional `ref` fields.
+Version 0.2 enforces `onDelete: restrict` and supports bounded one-level includes
+for declared relations. Arbitrary and recursive joins are intentionally excluded.
 
 ## Requirements
 
 - Node.js 20 or newer.
 - A writable **persistent** filesystem for writable mode.
-- Exactly one writable Node process per database path.
+- Exactly one active writer per database path. The default is one local process;
+  multi-server deployments require a strong external lease adapter and shared
+  durable storage.
 - macOS or Linux for supported production deployments.
 
-Writable boot rejects known serverless/edge environments. `readOnly: true` is available for inspection and controlled tooling, but does not make shared multi-server writes safe.
+Writable boot rejects known serverless/edge environments. `readOnly: true` is
+available for inspection and coordinated replicas. It does not permit unleased or
+simultaneous writes.
 
 ## Installation
 
@@ -73,36 +81,46 @@ pnpm add @agile-nuxt/edge-db @agile-nuxt/backend
 ## Nuxt Quick Start
 
 ```ts
+// server/backend.config.ts
+import { defineBackendConfig } from '@agile-nuxt/backend/config'
+
+export default defineBackendConfig({
+  auth: false,
+  db: {
+    path: process.env.EDGE_DB_PATH || './storage/edge-db'
+  },
+  entities: {
+    products: {
+      fields: {
+        id: 'id',
+        title: 'text',
+        price: 'integer',
+        status: 'text.default:active',
+        createdAt: 'datetime',
+        updatedAt: 'datetime'
+      },
+      indexes: ['status', 'createdAt'],
+      timestamps: true,
+      api: true,
+      permissions: {
+        list: 'public',
+        read: 'public',
+        create: 'disabled',
+        update: 'disabled',
+        delete: 'disabled'
+      }
+    }
+  }
+})
+```
+
+```ts
+// nuxt.config.ts
 export default defineNuxtConfig({
   modules: ['@agile-nuxt/backend'],
   nitro: { preset: 'node-server' },
   backend: {
-    auth: false,
-    db: {
-      path: process.env.EDGE_DB_PATH || './storage/edge-db'
-    },
-    entities: {
-      products: {
-        fields: {
-          id: 'id',
-          title: 'text',
-          price: 'integer',
-          status: 'text.default:active',
-          createdAt: 'datetime',
-          updatedAt: 'datetime'
-        },
-        indexes: ['status', 'createdAt'],
-        timestamps: true,
-        api: true,
-        permissions: {
-          list: 'public',
-          read: 'public',
-          create: 'disabled',
-          update: 'disabled',
-          delete: 'disabled'
-        }
-      }
-    }
+    configFile: './server/backend.config.ts'
   }
 })
 ```
@@ -375,7 +393,11 @@ edge-db backup /srv/backups/app-2026-06-24 --path /srv/app/storage/edge-db
 edge-db restore /srv/backups/app-2026-06-24 --path /srv/app/storage/edge-db
 ```
 
-Do **not** copy the live database folder while the application is writing. `db.backup()` pauses writes, stages a consistent copy, verifies its metadata, and atomically activates the backup target. Restore requires the writer to close, stages the replacement, then atomically swaps directories with rollback on activation failure.
+Do **not** copy the live database folder while the application is writing.
+`db.backup()` pauses writes, stages a consistent copy, verifies the backup format
+2 SHA-256 file inventory, and atomically activates the target. Restore requires
+the writer to close, verifies the complete inventory, stages the replacement, then
+atomically swaps directories with rollback on activation failure.
 
 ## Compaction and Diagnostics
 
@@ -383,6 +405,8 @@ Compaction pauses writes, creates and reload-verifies snapshots, atomically upda
 
 ```bash
 edge-db doctor --path ./storage/edge-db
+edge-db doctor --repair --path ./storage/edge-db
+edge-db schema diff --schema ./schema.json --path ./storage/edge-db
 edge-db inspect --path ./storage/edge-db
 edge-db compact --path ./storage/edge-db
 edge-db export ./data.json --path ./storage/edge-db
@@ -400,7 +424,11 @@ edge-db benchmark
 4. Start one application process and inspect boot recovery logs.
 5. Run `edge-db inspect --path <database-path>` from read-only tooling if further verification is needed.
 
-If a process crashed during append, recovery ignores only an incomplete/checksum-invalid tail record and reports the affected file. If corruption occurs earlier in a file, preserve the directory, restore the last verified backup, and retain the damaged copy for investigation.
+If a process crashed during append, writable recovery quarantines and truncates
+only the incomplete/checksum-invalid tail before new writes are accepted.
+Read-only recovery reports the tail without changing it. If corruption occurs
+earlier in a file, preserve the directory, restore the last verified backup, and
+retain the damaged copy for investigation.
 
 ## cPanel Deployment
 
@@ -412,9 +440,13 @@ If a process crashed during append, recovery ignores only an incomplete/checksum
 6. Ensure the Node user can read, write, rename, delete, and create exclusive files there.
 7. Run `edge-db doctor` using the same Node user.
 8. Schedule backups using the CLI/API, not raw copies of the live folder.
-9. Run one cPanel Node application instance against that path.
+9. Run one cPanel Node application instance against that path, unless every
+   instance uses a tested external writer lease and shared persistent storage.
 
-Do not place storage inside `.output`, `/tmp`, or a deployment release directory that gets replaced. Multiple cPanel instances must use an external database instead; read-only mode is only for inspection and does not provide replication.
+Do not place storage inside `.output`, `/tmp`, or a deployment release directory
+that gets replaced. Multiple cPanel instances need shared durable storage plus an
+external writer lease; otherwise use an external database. Coordinator events can
+refresh read-only replicas but do not provide multi-active writes.
 
 ## Performance and Capacity
 
@@ -424,9 +456,9 @@ This package is best for operational CRUD datasets that fit comfortably in one N
 
 ## Roadmap
 
-- Safe relation includes constrained by declared relation metadata.
 - Additional index statistics and planner detail.
-- Optional dedicated server/replication mode, designed separately from v1 file writes.
+- More coordinator examples for Redis and etcd.
+- Migration tooling for large collections with progress checkpoints.
 
 ## Development
 

@@ -1,15 +1,41 @@
 import { access } from 'node:fs/promises'
 import { EdgeDbError } from '../core/errors.js'
 import { logEvent, type Logger } from '../core/logger.js'
-import type { NormalizedCollectionSchema, SchemaSyncOptions } from '../types/public.js'
+import type {
+  CollectionMigration,
+  NormalizedCollectionSchema,
+  SchemaChange,
+  SchemaSyncOptions
+} from '../types/public.js'
 import { SCHEMA_FORMAT_VERSION } from '../types/public.js'
 import { atomicWriteJson, readJsonFile } from '../storage/atomicFile.js'
+import { planCollectionChanges } from './planSchema.js'
 
-interface StoredCollectionSchema {
+export interface StoredCollectionSchema {
   formatVersion: number
   collection: string
   schema: NormalizedCollectionSchema
   updatedAt: string
+}
+
+export interface CollectionSchemaSyncResult {
+  warnings: string[]
+  changes: SchemaChange[]
+  previous?: StoredCollectionSchema
+  migration?: CollectionMigration
+}
+
+export async function writeStoredCollectionSchema(
+  path: string,
+  collection: string,
+  schema: NormalizedCollectionSchema
+): Promise<void> {
+  await atomicWriteJson(path, {
+    formatVersion: SCHEMA_FORMAT_VERSION,
+    collection,
+    schema,
+    updatedAt: new Date().toISOString()
+  } satisfies StoredCollectionSchema)
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -27,20 +53,18 @@ export async function syncCollectionSchema(
   desired: NormalizedCollectionSchema,
   options: SchemaSyncOptions,
   logger: Logger
-): Promise<string[]> {
+): Promise<CollectionSchemaSyncResult> {
   const warnings: string[] = []
   if (!(await exists(path))) {
     if (options.createCollections === false) {
       throw new EdgeDbError('SCHEMA_UNSAFE', `Collection "${collection}" is missing on disk.`)
     }
-    await atomicWriteJson(path, {
-      formatVersion: SCHEMA_FORMAT_VERSION,
-      collection,
-      schema: desired,
-      updatedAt: new Date().toISOString()
-    } satisfies StoredCollectionSchema)
+    await writeStoredCollectionSchema(path, collection, desired)
     logEvent(logger, 'info', 'schema.collection_created', 'Collection schema created.', { collection })
-    return warnings
+    return {
+      warnings,
+      changes: planCollectionChanges(collection, undefined, desired)
+    }
   }
 
   const stored = await readJsonFile<StoredCollectionSchema>(path)
@@ -51,16 +75,30 @@ export async function syncCollectionSchema(
     )
   }
 
-  for (const [field, definition] of Object.entries(stored.schema.fields)) {
-    const next = desired.fields[field]
-    if (!next) {
-      warnings.push(`Field "${collection}.${field}" is absent from code but was preserved on disk.`)
-      continue
-    }
-    if (next.type !== definition.type) {
-      const message = `Unsafe type change for "${collection}.${field}" from ${definition.type} to ${next.type}.`
-      if (options.mode === 'strict') throw new EdgeDbError('SCHEMA_UNSAFE', message)
-      warnings.push(message)
+  const changes = planCollectionChanges(collection, stored.schema, desired)
+  const migrationChanges = changes.filter((change) => change.requiresMigration)
+  const migration = options.migrations?.[collection]
+  if (migrationChanges.length > 0 && !migration) {
+    throw new EdgeDbError(
+      'MIGRATION_REQUIRED',
+      `Schema changes for "${collection}" require an explicit migration handler.`,
+      { changes: migrationChanges }
+    )
+  }
+  if (changes.some((change) => !change.safe) && options.mode === 'strict' && !migration) {
+    throw new EdgeDbError('SCHEMA_UNSAFE', `Unsafe schema changes detected for "${collection}".`, {
+      changes
+    })
+  }
+  for (const change of changes.filter((item) => !item.safe)) {
+    warnings.push(change.description)
+  }
+  if (migrationChanges.length > 0) {
+    return {
+      warnings,
+      changes,
+      previous: stored,
+      ...(migration ? { migration } : {})
     }
   }
 
@@ -81,12 +119,7 @@ export async function syncCollectionSchema(
     unique: [...new Set([...stored.schema.unique, ...desired.unique])]
   }
 
-  await atomicWriteJson(path, {
-    formatVersion: SCHEMA_FORMAT_VERSION,
-    collection,
-    schema: merged,
-    updatedAt: new Date().toISOString()
-  } satisfies StoredCollectionSchema)
+  await writeStoredCollectionSchema(path, collection, merged)
 
   for (const warning of warnings) {
     logEvent(logger, 'warn', 'schema.sync_warning', warning, { collection })
@@ -95,5 +128,5 @@ export async function syncCollectionSchema(
     collection,
     warnings: warnings.length
   })
-  return warnings
+  return { warnings, changes, previous: stored }
 }

@@ -1,4 +1,4 @@
-import { mkdir, readdir, rename, stat } from 'node:fs/promises'
+import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Collection, type CollectionState } from './collection.js'
 import { resolveConfig, type ResolvedDatabaseConfig } from './config.js'
@@ -7,14 +7,21 @@ import { EdgeDbError } from './errors.js'
 import { assertSupportedEnvironment } from './environment.js'
 import { createId, createTransactionId } from './ids.js'
 import { createLogger, logEvent, type Logger } from './logger.js'
+import { FileCoordinator } from '../coordination/fileCoordinator.js'
 import { IndexRegistry } from '../index/indexRegistry.js'
 import { normalizeSchema } from '../schema/normalizeSchema.js'
+import { loadStoredSchema, planSchema } from '../schema/planSchema.js'
 import { schemaHash } from '../schema/schemaHash.js'
-import { syncCollectionSchema } from '../schema/schemaSync.js'
+import {
+  syncCollectionSchema,
+  writeStoredCollectionSchema,
+  type CollectionSchemaSyncResult,
+  type StoredCollectionSchema
+} from '../schema/schemaSync.js'
 import { validateSchema } from '../schema/validateSchema.js'
 import { appendLogRecords, readLog } from '../storage/appendLog.js'
+import { atomicWriteJson, readJsonFile } from '../storage/atomicFile.js'
 import { createBackup, restoreBackup } from '../storage/backup.js'
-import { LockFile } from '../storage/lockFile.js'
 import {
   manifestExists,
   readManifest,
@@ -24,15 +31,26 @@ import {
 import { createStoragePaths, type StoragePaths } from '../storage/paths.js'
 import type { LogRecord } from '../storage/recordCodec.js'
 import { readSnapshot, writeSnapshot } from '../storage/snapshot.js'
+import { projectRecord } from '../query/projection.js'
 import { WriteQueue } from '../transaction/writeQueue.js'
 import {
   STORAGE_FORMAT_VERSION,
+  type CollectionMigration,
+  type DatabaseChangeEvent,
+  type DatabaseCoordinator,
   type DatabaseDiagnostics,
   type DatabaseHooks,
+  type DatabaseLease,
   type DatabaseOptions,
+  type IncludeQuery,
+  type InferCreate,
+  type InferUpdate,
   type InferSchema,
+  type NormalizedCollectionSchema,
   type NormalizedSchema,
   type RecoverySummary,
+  type SchemaChange,
+  type SchemaChangePlan,
   type SchemaDefinition,
   type StoragePermissionCheck,
   type WriteOperation
@@ -46,6 +64,26 @@ interface QueryStats {
   total: number
   scans: number
   slow: number
+}
+
+interface PendingMigration {
+  changes: SchemaChange[]
+  migration: CollectionMigration
+  previous: StoredCollectionSchema
+}
+
+interface MigrationMarker {
+  formatVersion: 1
+  desiredSchemaHash: string
+  sequence: number
+  collections: Record<
+    string,
+    {
+      previous: StoredCollectionSchema
+      desired: NormalizedCollectionSchema
+      snapshotPath: string
+    }
+  >
 }
 
 async function directorySize(path: string): Promise<number> {
@@ -80,12 +118,59 @@ function applyOperationToState(state: CollectionState, operation: WriteOperation
   }
 }
 
+function assertRecordMatchesSchema(
+  collection: string,
+  record: Record<string, unknown>,
+  schema: NormalizedCollectionSchema
+): void {
+  for (const field of Object.keys(record)) {
+    if (!schema.fields[field]) {
+      throw new EdgeDbError(
+        'UNKNOWN_FIELD',
+        `Migration retained unknown field "${collection}.${field}".`
+      )
+    }
+  }
+  for (const [field, definition] of Object.entries(schema.fields)) {
+    const value = record[field]
+    if (value === undefined || value === null) {
+      if (!definition.nullable && !definition.hasDefault) {
+        throw new EdgeDbError(
+          'VALIDATION_FAILED',
+          `Migration did not provide required field "${collection}.${field}".`
+        )
+      }
+      continue
+    }
+    const valid =
+      definition.type === 'json' ||
+      ((definition.type === 'id' ||
+        definition.type === 'text' ||
+        definition.type === 'datetime') &&
+        typeof value === 'string') ||
+      ((definition.type === 'integer' || definition.type === 'real') &&
+        typeof value === 'number' &&
+        Number.isFinite(value) &&
+        (definition.type !== 'integer' || Number.isInteger(value))) ||
+      (definition.type === 'boolean' && typeof value === 'boolean')
+    if (!valid) {
+      throw new EdgeDbError(
+        'VALIDATION_FAILED',
+        `Migration produced an invalid ${definition.type} value for "${collection}.${field}".`
+      )
+    }
+  }
+}
+
 export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
   readonly schema: NormalizedSchema
   readonly config: ResolvedDatabaseConfig
   private readonly paths: StoragePaths
   private readonly logger: Logger
-  private readonly lock: LockFile
+  private readonly coordinator: DatabaseCoordinator
+  private readonly ownerId: string
+  private lease: DatabaseLease | undefined
+  private unsubscribeCoordinator: (() => void | Promise<void>) | undefined
   private readonly writeQueue = new WriteQueue()
   private readonly states = new Map<string, CollectionState>()
   private readonly collections = new Map<string, Collection>()
@@ -97,13 +182,15 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
     replayedOperations: 0,
     ignoredUncommittedTransactions: 0,
     ignoredTailRecords: 0,
-    corruptTailFiles: []
+    corruptTailFiles: [],
+    repairedTailBytes: 0
   }
   private permissionChecks: StoragePermissionCheck[] = []
   private warnings: string[] = []
   private sequence = 0
   private readonly hooks: DatabaseHooks
   private readonly queryStats: QueryStats = { total: 0, scans: 0, slow: 0 }
+  private readonly pendingMigrations = new Map<string, PendingMigration>()
 
   constructor(
     private readonly options: DatabaseOptions<TSchema>,
@@ -114,7 +201,9 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
     this.config = resolveConfig(options as DatabaseOptions<SchemaDefinition>)
     this.paths = createStoragePaths(this.config.path)
     this.logger = createLogger(options.logger, this.config.debug)
-    this.lock = new LockFile(this.paths.lock, this.paths.root)
+    this.coordinator =
+      options.coordination?.adapter ?? new FileCoordinator(this.paths.lock, this.paths.root)
+    this.ownerId = options.coordination?.ownerId ?? createId('owner')
     this.hooks = hooks
   }
 
@@ -136,23 +225,33 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
         { checks: diagnostics.checks }
       )
     }
-    if (!this.config.readOnly) await this.lock.acquire()
+    if (!this.config.readOnly) {
+      this.lease = await this.coordinator.acquireWriterLease({
+        databasePath: this.paths.root,
+        ownerId: this.ownerId,
+        ttlMs: this.options.coordination?.leaseTtlMs ?? 30_000
+      })
+    }
 
     try {
       await this.loadOrCreateManifest()
+      await this.recoverPendingMigration()
       await this.syncSchemas()
       const committed = await this.readCommittedTransactions()
       for (const [name, collectionSchema] of Object.entries(this.schema)) {
         const state = await this.loadCollection(name, collectionSchema, committed)
         this.states.set(name, state)
       }
+      await this.applyPendingMigrations()
       this.createCollectionHandles()
       this.booted = true
+      await this.subscribeToCoordinator()
       this.bootDurationMs = performance.now() - started
       logEvent(this.logger, 'info', 'database.recovery', 'Storage recovery completed.', {
         replayedOperations: this.recovery.replayedOperations,
         ignoredUncommittedTransactions: this.recovery.ignoredUncommittedTransactions,
         ignoredTailRecords: this.recovery.ignoredTailRecords,
+        repairedTailBytes: this.recovery.repairedTailBytes,
         corruptTailFiles: this.recovery.corruptTailFiles
       })
       logEvent(this.logger, 'info', 'database.boot', 'Database boot completed.', {
@@ -170,7 +269,8 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
         )
       }
     } catch (error) {
-      await this.lock.release()
+      await this.lease?.release()
+      this.lease = undefined
       throw error
     }
   }
@@ -210,8 +310,121 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
     await writeManifest(this.paths.manifest, this.manifest)
   }
 
+  private async recoverPendingMigration(): Promise<void> {
+    let marker: MigrationMarker
+    try {
+      marker = await readJsonFile<MigrationMarker>(this.paths.migration)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw error
+    }
+    if (marker.formatVersion !== 1) {
+      throw new EdgeDbError('FORMAT_UNSUPPORTED', 'Unsupported migration marker format.')
+    }
+
+    try {
+      await Promise.all(
+        Object.values(marker.collections).map((entry) => readSnapshot(entry.snapshotPath))
+      )
+    } catch (error) {
+      for (const [name, entry] of Object.entries(marker.collections)) {
+        await atomicWriteJson(this.paths.collection(name).schema, entry.previous)
+      }
+      await rm(this.paths.migration, { force: true })
+      this.warnings.push(
+        `An incomplete schema migration was rolled back: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+      return
+    }
+
+    for (const [name, entry] of Object.entries(marker.collections)) {
+      await writeStoredCollectionSchema(this.paths.collection(name).schema, name, entry.desired)
+      const config = this.manifest!.collections[name]!
+      config.snapshotSequence = marker.sequence
+      config.lastSequence = Math.max(config.lastSequence, marker.sequence)
+      config.operationCountSinceSnapshot = 0
+    }
+    this.manifest!.schemaHash = marker.desiredSchemaHash
+    await writeManifest(this.paths.manifest, this.manifest!)
+    await rm(this.paths.migration, { force: true })
+    this.warnings.push('A previously staged schema migration was completed during recovery.')
+  }
+
+  private async applyPendingMigrations(): Promise<void> {
+    if (this.pendingMigrations.size === 0) return
+    const migratedStates = new Map<string, CollectionState>()
+    const marker: MigrationMarker = {
+      formatVersion: 1,
+      desiredSchemaHash: schemaHash(this.schema),
+      sequence: this.sequence,
+      collections: {}
+    }
+
+    for (const [name, pending] of this.pendingMigrations) {
+      const desired = this.schema[name]!
+      const records = new Map<string, Record<string, unknown>>()
+      for (const [id, record] of this.states.get(name)!.records) {
+        const migrated = await pending.migration(structuredClone(record), {
+          collection: name,
+          changes: pending.changes
+        })
+        if (String(migrated.id) !== id) {
+          throw new EdgeDbError(
+            'VALIDATION_FAILED',
+            `Migration for "${name}" cannot change record ids.`
+          )
+        }
+        assertRecordMatchesSchema(name, migrated, desired)
+        records.set(id, migrated)
+      }
+      const state = { records, indexes: new IndexRegistry(desired, records) }
+      migratedStates.set(name, state)
+      marker.collections[name] = {
+        previous: pending.previous,
+        desired,
+        snapshotPath: this.paths.collection(name).snapshot(this.sequence)
+      }
+    }
+
+    await atomicWriteJson(this.paths.migration, marker)
+    try {
+      for (const [name, state] of migratedStates) {
+        const snapshotPath = marker.collections[name]!.snapshotPath
+        await writeSnapshot(snapshotPath, name, this.sequence, [...state.records.values()])
+        await readSnapshot(snapshotPath)
+      }
+      for (const [name, state] of migratedStates) {
+        this.states.set(name, state)
+        await writeStoredCollectionSchema(
+          this.paths.collection(name).schema,
+          name,
+          this.schema[name]!
+        )
+        const config = this.manifest!.collections[name]!
+        config.snapshotSequence = this.sequence
+        config.lastSequence = Math.max(config.lastSequence, this.sequence)
+        config.operationCountSinceSnapshot = 0
+      }
+      this.manifest!.schemaHash = marker.desiredSchemaHash
+      await writeManifest(this.paths.manifest, this.manifest!)
+      await rm(this.paths.migration, { force: true })
+      logEvent(this.logger, 'info', 'schema.migrated', 'Schema migration completed.', {
+        collections: [...migratedStates.keys()],
+        sequence: this.sequence
+      })
+    } catch (error) {
+      logEvent(this.logger, 'error', 'schema.migration_failed', 'Schema migration failed.', {
+        reason: error instanceof Error ? error.message : String(error)
+      })
+      throw error
+    }
+  }
+
   private async syncSchemas(): Promise<void> {
     if (!this.manifest) return
+    this.pendingMigrations.clear()
     for (const [name, collection] of Object.entries(this.schema)) {
       const paths = this.paths.collection(name)
       await mkdir(paths.root, { recursive: true })
@@ -228,26 +441,36 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
         }
       }
       if (!this.config.readOnly && this.options.schemaSync?.enabled !== false) {
-        this.warnings.push(
-          ...(await syncCollectionSchema(
-            paths.schema,
-            name,
-            collection,
-            this.options.schemaSync ?? {},
-            this.logger
-          ))
+        const result: CollectionSchemaSyncResult = await syncCollectionSchema(
+          paths.schema,
+          name,
+          collection,
+          this.options.schemaSync ?? {},
+          this.logger
         )
+        this.warnings.push(...result.warnings)
+        if (result.migration && result.previous) {
+          this.pendingMigrations.set(name, {
+            changes: result.changes.filter((change) => change.requiresMigration),
+            migration: result.migration,
+            previous: result.previous
+          })
+        }
       }
     }
-    if (!this.config.readOnly) {
+    if (!this.config.readOnly && this.pendingMigrations.size === 0) {
       this.manifest.schemaHash = schemaHash(this.schema)
       await writeManifest(this.paths.manifest, this.manifest)
     }
   }
 
   private async readCommittedTransactions(): Promise<Set<string>> {
-    const result = await readLog(this.paths.journal)
+    const result = await readLog(this.paths.journal, {
+      repairTail: !this.config.readOnly,
+      quarantineTail: true
+    })
     this.recovery.ignoredTailRecords += result.ignoredTailRecords
+    this.recovery.repairedTailBytes += result.repairedTailBytes
     if (result.tailWasCorrupt) this.recovery.corruptTailFiles.push(this.paths.journal)
     const started = new Set<string>()
     const committed = new Set<string>()
@@ -288,8 +511,12 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
       files = []
     }
     for (const file of files) {
-      const result = await readLog(join(paths.root, file))
+      const result = await readLog(join(paths.root, file), {
+        repairTail: !this.config.readOnly,
+        quarantineTail: true
+      })
       this.recovery.ignoredTailRecords += result.ignoredTailRecords
+      this.recovery.repairedTailBytes += result.repairedTailBytes
       if (result.tailWasCorrupt) this.recovery.corruptTailFiles.push(join(paths.root, file))
       for (const record of result.records) {
         this.sequence = Math.max(this.sequence, record.sequence)
@@ -332,7 +559,7 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
           this.config,
           async (operations) => {
             await this.writeQueue.run(async () => {
-              this.assertWritable()
+              await this.assertWritable()
               this.validateOperations(operations)
               await this.persistOperations(operations)
               operations.forEach((operation) => applyOperationToState(this.states.get(operation.collection)!, operation))
@@ -346,7 +573,8 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
             this.queryStats.total += 1
             if (plan.strategy === 'scan') this.queryStats.scans += 1
             if (plan.durationMs >= this.config.slowQueryMs) this.queryStats.slow += 1
-          }
+          },
+          (collection, records, include) => this.resolveIncludes(collection, records, include)
         )
       )
     }
@@ -356,20 +584,119 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
     if (!this.booted) throw new EdgeDbError('NOT_BOOTED', 'Call db.boot() before using the database.')
   }
 
-  private assertWritable(): void {
+  private async assertWritable(): Promise<void> {
     this.assertBooted()
     if (this.config.readOnly) {
       throw new EdgeDbError('READ_ONLY', 'Database is open in readOnly mode.')
     }
+    try {
+      await this.lease?.assertOwned()
+    } catch (error) {
+      throw new EdgeDbError(
+        'LEASE_LOST',
+        'The database writer lease is no longer owned. Writes are disabled until restart.',
+        { cause: error instanceof Error ? error.message : String(error) }
+      )
+    }
   }
 
-  collection<K extends keyof InferSchema<TSchema> & string>(name: K): Collection<InferSchema<TSchema>[K]>
+  collection<K extends keyof InferSchema<TSchema> & string>(
+    name: K
+  ): Collection<
+    InferSchema<TSchema>[K],
+    InferCreate<TSchema[K]>,
+    InferUpdate<TSchema[K]>
+  >
   collection<TRecord extends Record<string, unknown> = Record<string, unknown>>(name: string): Collection<TRecord>
-  collection(name: string): Collection {
+  collection(name: string): Collection<any, any, any> {
     this.assertBooted()
     const collection = this.collections.get(name)
     if (!collection) throw new EdgeDbError('COLLECTION_NOT_FOUND', `Collection "${name}" is not defined.`)
     return collection
+  }
+
+  private async resolveIncludes(
+    collectionName: string,
+    records: Record<string, unknown>[],
+    include: IncludeQuery,
+    states: Map<string, CollectionState> = this.states
+  ): Promise<Record<string, unknown>[]> {
+    const sourceSchema = this.schema[collectionName]!
+    const entries = Object.entries(include)
+    for (const [relationName, options] of entries) {
+      const relation = sourceSchema.relations[relationName]
+      if (!relation) {
+        throw new EdgeDbError(
+          'SCHEMA_INVALID',
+          `Relation "${collectionName}.${relationName}" is not declared.`
+        )
+      }
+      const requestedLimit = options === true ? this.config.maxIncludeRecords : options.limit
+      if (
+        requestedLimit !== undefined &&
+        (!Number.isInteger(requestedLimit) ||
+          requestedLimit < 1 ||
+          requestedLimit > this.config.maxIncludeRecords)
+      ) {
+        throw new EdgeDbError(
+          'QUERY_LIMIT',
+          `Include limit must be between 1 and ${this.config.maxIncludeRecords}.`
+        )
+      }
+    }
+
+    return Promise.all(
+      records.map(async (record) => {
+        const output = { ...record }
+        for (const [relationName, options] of entries) {
+          const relation = sourceSchema.relations[relationName]!
+          const targetSchema = this.schema[relation.collection]
+          const targetState = states.get(relation.collection)
+          if (!targetSchema || !targetState) {
+            throw new EdgeDbError(
+              'SCHEMA_INVALID',
+              `Relation "${collectionName}.${relationName}" targets an unknown collection.`
+            )
+          }
+          const select = options === true ? undefined : options.select
+          const limit =
+            options === true
+              ? this.config.maxIncludeRecords
+              : options.limit ?? this.config.maxIncludeRecords
+          const foreignField = relation.foreignField ?? 'id'
+          const indexed =
+            foreignField === 'id' ||
+            targetSchema.unique.includes(foreignField) ||
+            targetSchema.indexes.some((index) => index[0] === foreignField)
+          if (!indexed) {
+            logEvent(
+              this.logger,
+              'warn',
+              'query.planner_warning',
+              `Relation include "${collectionName}.${relationName}" scans "${relation.collection}".`,
+              { recommendedIndex: [foreignField] }
+            )
+          }
+
+          if (relation.type === 'belongsTo') {
+            const localValue = record[relation.localField]
+            const related = [...targetState.records.values()].find(
+              (candidate) => Object.is(candidate[foreignField], localValue)
+            )
+            output[relationName] = related
+              ? projectRecord(related, targetSchema, select)
+              : null
+          } else {
+            const localValue = record[relation.localField]
+            output[relationName] = [...targetState.records.values()]
+              .filter((candidate) => Object.is(candidate[foreignField], localValue))
+              .slice(0, limit)
+              .map((candidate) => projectRecord(candidate, targetSchema, select))
+          }
+        }
+        return output
+      })
+    )
   }
 
   private cloneStates(): Map<string, CollectionState> {
@@ -385,7 +712,7 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
 
   async transaction<T>(callback: (tx: TransactionDatabase) => Promise<T>): Promise<T> {
     return this.writeQueue.run(async () => {
-      this.assertWritable()
+      await this.assertWritable()
       const states = this.cloneStates()
       const staged: WriteOperation[] = []
       const handles = new Map<string, Collection>()
@@ -408,7 +735,8 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
               this.queryStats.total += 1
               if (plan.strategy === 'scan') this.queryStats.scans += 1
               if (plan.durationMs >= this.config.slowQueryMs) this.queryStats.slow += 1
-            }
+            },
+            (collection, records, include) => this.resolveIncludes(collection, records, include, states)
           )
         )
       }
@@ -532,6 +860,7 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
       ts: Date.now()
     }
     await appendLogRecords(this.paths.journal, [start])
+    await this.hooks.onStorageStage?.('journal-start', { txId })
 
     const grouped = new Map<string, LogRecord[]>()
     for (const operation of operations) {
@@ -575,6 +904,10 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
           this.paths.collection(collection).log(collectionManifest.activeLogSegment),
           records
         )
+        await this.hooks.onStorageStage?.('collection-append', {
+          txId,
+          collection
+        })
       }
       await appendLogRecords(this.paths.journal, [
         {
@@ -586,6 +919,7 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
           ts: Date.now()
         }
       ])
+      await this.hooks.onStorageStage?.('journal-commit', { txId })
     } catch (error) {
       try {
         await appendLogRecords(this.paths.journal, [
@@ -618,12 +952,33 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
         operations.filter((operation) => operation.collection === collection).length
     }
     await writeManifest(this.paths.manifest, this.manifest!)
+    await this.hooks.onStorageStage?.('manifest-write', { txId })
     for (const operation of operations) await this.hooks.afterWrite?.(operation)
+    if (this.coordinator.publish) {
+      const event: DatabaseChangeEvent = {
+        databasePath: this.paths.root,
+        ownerId: this.ownerId,
+        sequence: this.sequence,
+        collections: [...new Set(operations.map((operation) => operation.collection))],
+        committedAt: new Date().toISOString()
+      }
+      try {
+        await this.coordinator.publish(event)
+      } catch (error) {
+        logEvent(
+          this.logger,
+          'warn',
+          'coordination.publish_failed',
+          'The transaction committed, but its coordination event could not be published.',
+          { reason: error instanceof Error ? error.message : String(error) }
+        )
+      }
+    }
   }
 
   async compact(): Promise<void> {
     await this.writeQueue.run(async () => {
-      this.assertWritable()
+      await this.assertWritable()
       await this.compactUnlocked()
     })
   }
@@ -656,6 +1011,10 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
       const snapshotPath = this.paths.collection(name).snapshot(this.sequence)
       await writeSnapshot(snapshotPath, name, this.sequence, [...state.records.values()])
       await readSnapshot(snapshotPath)
+      await this.hooks.onStorageStage?.('snapshot-write', {
+        collection: name,
+        sequence: this.sequence
+      })
       const config = this.manifest!.collections[name]!
       config.snapshotSequence = this.sequence
       config.lastSequence = this.sequence
@@ -676,6 +1035,10 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
         const snapshotPath = paths.snapshot(this.sequence)
         await writeSnapshot(snapshotPath, name, this.sequence, [...state.records.values()])
         await readSnapshot(snapshotPath)
+        await this.hooks.onStorageStage?.('snapshot-write', {
+          collection: name,
+          sequence: this.sequence
+        })
       }
 
       for (const [name, config] of Object.entries(this.manifest!.collections)) {
@@ -687,6 +1050,9 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
         await mkdir(this.paths.collection(name).archive, { recursive: true })
       }
       await writeManifest(this.paths.manifest, this.manifest!)
+      await this.hooks.onStorageStage?.('compaction-activate', {
+        sequence: this.sequence
+      })
 
       for (const [name, config] of Object.entries(this.manifest!.collections)) {
         const paths = this.paths.collection(name)
@@ -751,6 +1117,52 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
     })
   }
 
+  async planSchemaChanges(): Promise<SchemaChangePlan> {
+    return planSchema(await loadStoredSchema(this.paths.root), this.schema)
+  }
+
+  async refresh(): Promise<void> {
+    await this.writeQueue.run(async () => {
+      this.assertBooted()
+      if (!this.config.readOnly) {
+        throw new EdgeDbError('READ_ONLY', 'refresh() is reserved for read-only replicas.')
+      }
+      this.manifest = await readManifest(this.paths.manifest)
+      const committed = await this.readCommittedTransactions()
+      const nextStates = new Map<string, CollectionState>()
+      for (const [name, collectionSchema] of Object.entries(this.schema)) {
+        nextStates.set(name, await this.loadCollection(name, collectionSchema, committed))
+      }
+      this.states.clear()
+      for (const [name, state] of nextStates) this.states.set(name, state)
+      this.createCollectionHandles()
+      logEvent(this.logger, 'info', 'database.refresh', 'Read-only replica refreshed.', {
+        sequence: this.sequence
+      })
+    })
+  }
+
+  private async subscribeToCoordinator(): Promise<void> {
+    if (
+      !this.config.readOnly ||
+      !this.options.coordination?.autoRefreshReadOnly ||
+      !this.coordinator.subscribe
+    ) {
+      return
+    }
+    const unsubscribe = await this.coordinator.subscribe(this.paths.root, async (event) => {
+      if (event.ownerId === this.ownerId || event.sequence <= this.sequence || !this.booted) return
+      try {
+        await this.refresh()
+      } catch (error) {
+        logEvent(this.logger, 'error', 'database.refresh_failed', 'Read-only refresh failed.', {
+          reason: error instanceof Error ? error.message : String(error)
+        })
+      }
+    })
+    if (unsubscribe) this.unsubscribeCoordinator = unsubscribe
+  }
+
   async diagnostics(): Promise<DatabaseDiagnostics> {
     this.assertBooted()
     const collections = await Promise.all(
@@ -781,15 +1193,22 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
       platform: process.platform,
       nodeVersion: process.version,
       readOnly: this.config.readOnly,
-      lockStatus: this.config.readOnly ? 'not-required' : this.lock.isOwned ? 'owned' : 'unavailable',
+      lockStatus: this.config.readOnly ? 'not-required' : this.lease ? 'owned' : 'unavailable',
       storageSizeBytes: await directorySize(this.paths.root),
       collectionCount: collections.length,
       collections,
       bootDurationMs: this.bootDurationMs,
       replayedOperations: this.recovery.replayedOperations,
+      ignoredTailRecords: this.recovery.ignoredTailRecords,
+      repairedTailBytes: this.recovery.repairedTailBytes,
       compactionStatus: this.compacting ? 'running' : 'idle',
       permissionChecks: this.permissionChecks,
       warnings: [...this.warnings],
+      coordination: {
+        adapter: this.coordinator.name,
+        ownerId: this.ownerId,
+        writerLease: this.config.readOnly ? 'not-required' : this.lease ? 'owned' : 'unavailable'
+      },
       ...(this.config.queryStats ? { queryStats: { ...this.queryStats } } : {})
     }
   }
@@ -797,7 +1216,10 @@ export class Database<TSchema extends SchemaDefinition = SchemaDefinition> {
   async close(): Promise<void> {
     if (!this.booted) return
     await this.writeQueue.idle()
-    await this.lock.release()
+    await this.unsubscribeCoordinator?.()
+    this.unsubscribeCoordinator = undefined
+    await this.lease?.release()
+    this.lease = undefined
     this.booted = false
     this.states.clear()
     this.collections.clear()

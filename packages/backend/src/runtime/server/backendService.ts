@@ -1,4 +1,4 @@
-import type { Database, FindQuery } from '@agile-nuxt/edge-db'
+import type { Database, FindQuery, IncludeQuery } from '@agile-nuxt/edge-db'
 import { apiError } from './errors/apiError.js'
 import { assertPermission } from './permissions/permissions.js'
 import { sanitizeOutput, sanitizeWrite } from './security/fieldSecurity.js'
@@ -41,11 +41,109 @@ export class BackendService {
   ): Promise<unknown> {
     const entity = this.getEntity(entityName)
     await assertPermission(entityName, entity, 'list', user)
+    const { include, ...baseQuery } = query
     const result = await this.db.collection(entityName).findMany({
-      ...query,
-      ...(entity.publicFields ? { select: entity.publicFields } : {})
+      ...baseQuery
     })
-    return { ...result, data: result.data.map((record: Record<string, unknown>) => sanitizeOutput(entity, record)) }
+    const data = include
+      ? await this.resolveIncludes(entityName, entity, result.data, include, user)
+      : result.data.map((record: Record<string, unknown>) => sanitizeOutput(entity, record))
+    return { ...result, data }
+  }
+
+  private async resolveIncludes(
+    entityName: string,
+    entity: BackendEntity,
+    records: Record<string, unknown>[],
+    include: IncludeQuery,
+    user: BackendUser | null
+  ): Promise<Record<string, unknown>[]> {
+    const allowed = new Set(entity.includes ?? [])
+    for (const relationName of Object.keys(include)) {
+      if (!allowed.has(relationName)) {
+        throw apiError(400, `Include "${entityName}.${relationName}" is not exposed.`)
+      }
+    }
+
+    return Promise.all(
+      records.map(async (record) => {
+        const output = sanitizeOutput(entity, record)
+        for (const [relationName, options] of Object.entries(include)) {
+          const relation = entity.relations?.[relationName]
+          if (!relation) throw apiError(400, `Unknown relation "${entityName}.${relationName}".`)
+          const target = this.getEntity(relation.collection)
+          const targetCollection = this.db.collection(relation.collection)
+          const foreignField = relation.foreignField ?? 'id'
+          const localValue = record[relation.localField]
+          const selected = options === true ? undefined : options.select
+          const limit = options === true ? undefined : options.limit
+
+          if (relation.type === 'belongsTo') {
+            const related = await targetCollection.findFirstInternal({
+              where: { [foreignField]: localValue }
+            })
+            output[relationName] =
+              related && (await this.canReadIncluded(relation.collection, target, related, user))
+                ? this.selectIncluded(target, related, selected)
+                : null
+          } else {
+            const related = await targetCollection.findMany({
+              where: { [foreignField]: localValue },
+              ...(limit ? { limit } : {})
+            })
+            const visible: Record<string, unknown>[] = []
+            for (const candidate of related.data) {
+              const internal =
+                (await targetCollection.findByIdInternal(String(candidate.id))) ?? candidate
+              if (
+                await this.canReadIncluded(
+                  relation.collection,
+                  target,
+                  internal,
+                  user
+                )
+              ) {
+                visible.push(this.selectIncluded(target, internal, selected))
+              }
+            }
+            output[relationName] = visible
+          }
+        }
+        return output
+      })
+    )
+  }
+
+  private async canReadIncluded(
+    entityName: string,
+    entity: BackendEntity,
+    record: Record<string, unknown>,
+    user: BackendUser | null
+  ): Promise<boolean> {
+    try {
+      await assertPermission(entityName, entity, 'read', user, record)
+      return true
+    } catch (error) {
+      const statusCode = (error as { statusCode?: number }).statusCode
+      if (statusCode === 401 || statusCode === 403) return false
+      throw error
+    }
+  }
+
+  private selectIncluded(
+    entity: BackendEntity,
+    record: Record<string, unknown>,
+    select?: string[]
+  ): Record<string, unknown> {
+    const sanitized = sanitizeOutput(entity, record)
+    if (!select) return sanitized
+    for (const field of select) {
+      if (!(field in entity.fields)) throw apiError(400, `Unknown included field "${field}".`)
+      if (!(field in sanitized)) {
+        throw apiError(400, `Included field "${field}" is not publicly readable.`)
+      }
+    }
+    return Object.fromEntries(select.map((field) => [field, sanitized[field]]))
   }
 
   async read(entityName: string, id: string, user: BackendUser | null): Promise<unknown> {

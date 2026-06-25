@@ -16,6 +16,10 @@ import {
   type RefreshSession
 } from '../src/runtime/server/auth/session.js'
 import { RateLimiter } from '../src/runtime/server/security/rateLimit.js'
+import {
+  parseQueryJson,
+  validateFindQueryShape
+} from '../src/runtime/server/security/query.js'
 
 const roots: string[] = []
 afterEach(async () => {
@@ -66,13 +70,22 @@ async function runtime() {
           id: 'id',
           title: 'text',
           status: 'text.default:active',
+          ownerId: 'text.nullable',
           internalNote: 'text.private',
           createdAt: 'datetime',
           updatedAt: 'datetime'
         },
-        indexes: ['status'],
+        indexes: ['status', 'ownerId'],
         timestamps: true,
         api: true,
+        includes: ['owner'],
+        relations: {
+          owner: {
+            type: 'belongsTo',
+            collection: 'users',
+            localField: 'ownerId'
+          }
+        },
         permissions: {
           list: 'public',
           read: 'public',
@@ -112,10 +125,13 @@ describe('backend security', () => {
       const raw = await sessions.findByIdInternal(created.session.id)
       expect(raw?.refreshTokenHash).toBe(hashRefreshToken(created.token, 'r'.repeat(48)))
       expect(raw?.refreshTokenHash).not.toBe(created.token)
-      await rotateRefreshSession(sessions, created.token, 'r'.repeat(48))
+      const rotated = await rotateRefreshSession(app.db, created.token, 'r'.repeat(48))
       await expect(
-        rotateRefreshSession(sessions, created.token, 'r'.repeat(48))
-      ).rejects.toThrow('invalid or expired')
+        rotateRefreshSession(app.db, created.token, 'r'.repeat(48))
+      ).rejects.toThrow('reuse detected')
+      const family = await sessions.findMany({ where: { familyId: rotated.familyId } })
+      expect(family.data.every((session) => Boolean(session.revokedAt))).toBe(true)
+      expect(family.data.some((session) => Boolean(session.reuseDetectedAt))).toBe(true)
     } finally {
       await app.db.close()
     }
@@ -148,10 +164,54 @@ describe('backend security', () => {
     }
   })
 
-  it('rate limits repeated keys', () => {
+  it('rate limits repeated keys', async () => {
     const limiter = new RateLimiter(2, 60_000)
-    limiter.assertAllowed('ip')
-    limiter.assertAllowed('ip')
-    expect(() => limiter.assertAllowed('ip')).toThrow()
+    await limiter.assertAllowed('ip')
+    await limiter.assertAllowed('ip')
+    await expect(limiter.assertAllowed('ip')).rejects.toThrow()
+  })
+
+  it('rejects malformed and unknown query shapes', () => {
+    expect(() => parseQueryJson('{broken', 'where')).toThrow()
+    expect(() => validateFindQueryShape({ offset: 10 })).toThrow()
+    expect(() => validateFindQueryShape({ include: { owner: { nested: true } } })).toThrow()
+    expect(validateFindQueryShape({ where: { status: 'active' }, limit: 10 })).toEqual({
+      where: { status: 'active' },
+      limit: 10
+    })
+  })
+
+  it('applies target permissions and public fields to relation includes', async () => {
+    const app = await runtime()
+    try {
+      const owner = await app.db.collection('users').create({
+        email: 'owner@example.com',
+        passwordHash: await hashPassword('long enough password')
+      })
+      await app.db.collection('products').create({
+        title: 'Related',
+        ownerId: owner.id,
+        internalNote: 'hidden'
+      })
+      const anonymous = (await app.service.list(
+        'products',
+        { include: { owner: true } },
+        null
+      )) as { data: Array<Record<string, unknown>> }
+      expect(anonymous.data[0]?.owner).toBeNull()
+
+      const admin = (await app.service.list(
+        'products',
+        { include: { owner: true } },
+        { id: 'admin', role: 'admin' }
+      )) as { data: Array<Record<string, unknown>> }
+      expect(admin.data[0]?.owner).toMatchObject({
+        id: owner.id,
+        email: 'owner@example.com'
+      })
+      expect(admin.data[0]?.owner).not.toHaveProperty('passwordHash')
+    } finally {
+      await app.db.close()
+    }
   })
 })

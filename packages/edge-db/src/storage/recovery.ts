@@ -48,7 +48,8 @@ export function recoverTransactions(
       replayedOperations: operations.length,
       ignoredUncommittedTransactions: pending.size,
       ignoredTailRecords: baseSummary?.ignoredTailRecords ?? 0,
-      corruptTailFiles: baseSummary?.corruptTailFiles ?? []
+      corruptTailFiles: baseSummary?.corruptTailFiles ?? [],
+      repairedTailBytes: baseSummary?.repairedTailBytes ?? 0
     }
   }
 }

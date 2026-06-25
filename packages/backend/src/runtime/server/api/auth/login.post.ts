@@ -11,7 +11,7 @@ export default defineEventHandler(async (event) => {
   const auth = runtime.config.auth
   if (!auth) throw apiError(404, 'Auth is disabled.')
   const ip = getRequestIP(event, { xForwardedFor: true }) ?? 'unknown'
-  runtime.loginRateLimiter.assertAllowed(`login:${ip}`)
+  await runtime.loginRateLimiter.assertAllowed(`login:${ip}`, event)
   const body = await readLimitedBody<{ email?: string; password?: string }>(event, runtime)
   if (typeof body.email !== 'string' || typeof body.password !== 'string') {
     throw apiError(400, 'Email and password are required.')

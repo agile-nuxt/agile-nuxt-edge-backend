@@ -5,9 +5,14 @@ import { getCurrentUserFromRuntime } from './auth/currentUser.js'
 import { getBackendRuntime } from './instance.js'
 import { assertPermission } from './permissions/permissions.js'
 import type { BackendAction, BackendUser } from '../types.js'
+import type { BackendRealtimeEvent } from '../types.js'
 
 export async function useBackendDb() {
   return (await getBackendRuntime()).db
+}
+
+export async function publishBackendEvent(event: BackendRealtimeEvent): Promise<void> {
+  await (await getBackendRuntime()).realtime.publish(event)
 }
 
 export async function getCurrentUser(event: H3Event): Promise<BackendUser | null> {

@@ -9,6 +9,7 @@ export interface ResolvedDatabaseConfig {
   maxLimit: number
   maxBodySize: number
   maxInFilterItems: number
+  maxIncludeRecords: number
   allowUnindexedQueries: boolean
   snapshotsEnabled: boolean
   snapshotEveryOperations: number
@@ -37,6 +38,7 @@ export function resolveConfig(options: DatabaseOptions<SchemaDefinition>): Resol
     maxLimit: options.query?.maxLimit ?? 100,
     maxBodySize: options.query?.maxBodySize ?? 1_048_576,
     maxInFilterItems: options.query?.maxInFilterItems ?? 100,
+    maxIncludeRecords: options.query?.maxIncludeRecords ?? 100,
     allowUnindexedQueries: options.query?.allowUnindexedQueries ?? !strictIndexes,
     snapshotsEnabled: options.snapshots?.enabled ?? true,
     snapshotEveryOperations: options.snapshots?.everyOperations ?? 1_000,

@@ -3,33 +3,35 @@ import {
   getMethod,
   getRequestIP,
   getRequestURL,
-  readBody,
   type H3Event
 } from 'h3'
 import type { FindQuery } from '@agile-nuxt/edge-db'
 import { getCurrentUserFromRuntime } from '../../auth/currentUser.js'
 import { apiError } from '../../errors/apiError.js'
 import { getBackendRuntime } from '../../instance.js'
-import { assertBodySize, assertParsedBodySize } from '../../security/bodyLimit.js'
+import { readLimitedJsonBody } from '../../security/bodyLimit.js'
 import { assertCsrf } from '../../security/csrf.js'
+import { parseQueryJson, validateFindQueryShape } from '../../security/query.js'
 
 async function body(event: H3Event, limit: number): Promise<Record<string, unknown>> {
-  assertBodySize(event, limit)
-  const value = await readBody<Record<string, unknown>>(event)
-  assertParsedBodySize(value, limit)
-  return value ?? {}
+  return readLimitedJsonBody<Record<string, unknown>>(event, limit)
 }
 
 export default defineEventHandler(async (event) => {
   const runtime = await getBackendRuntime()
   const method = getMethod(event)
   const ip = getRequestIP(event, { xForwardedFor: true }) ?? 'unknown'
-  runtime.rateLimiter.assertAllowed(`${ip}:${method}`)
+  await runtime.rateLimiter.assertAllowed(`${ip}:${method}`, event)
   if (runtime.config.auth && runtime.config.auth.cookieMode && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-    assertCsrf(event)
+    assertCsrf(event, runtime)
   }
   const maxBodySize = runtime.config.security?.maxBodySize ?? runtime.db.config.maxBodySize
   const requestPath = getRequestURL(event).pathname
+  const rawUrl = event.node.req.url ?? requestPath
+  const maxQueryStringSize = runtime.config.security?.maxQueryStringSize ?? 8_192
+  if (Buffer.byteLength(rawUrl) > maxQueryStringSize) {
+    throw apiError(414, `Request URL exceeds ${maxQueryStringSize} bytes.`)
+  }
   const path = requestPath
     .slice(runtime.config.routePrefix.length)
     .split('/')
@@ -40,16 +42,22 @@ export default defineEventHandler(async (event) => {
 
   if (method === 'GET' && !second) {
     const query = event.node.req.url ? new URL(event.node.req.url, 'http://localhost').searchParams : undefined
-    const parsed: FindQuery = {
-      ...(query?.get('where') ? { where: JSON.parse(query.get('where')!) } : {}),
-      ...(query?.get('orderBy') ? { orderBy: JSON.parse(query.get('orderBy')!) } : {}),
+    const parsed: FindQuery = validateFindQueryShape({
+      ...(query?.get('where') ? { where: parseQueryJson(query.get('where'), 'where') } : {}),
+      ...(query?.get('orderBy')
+        ? { orderBy: parseQueryJson(query.get('orderBy'), 'orderBy') }
+        : {}),
       ...(query?.get('limit') ? { limit: Number(query.get('limit')) } : {}),
       ...(query?.get('cursor') ? { cursor: query.get('cursor')! } : {})
-    }
+    })
     return runtime.service.list(entity, parsed, user)
   }
   if (method === 'POST' && second === 'query') {
-    return runtime.service.list(entity, (await body(event, maxBodySize)) as FindQuery, user)
+    return runtime.service.list(
+      entity,
+      validateFindQueryShape(await body(event, maxBodySize)),
+      user
+    )
   }
   if (method === 'POST' && !second) {
     return runtime.service.create(entity, await body(event, maxBodySize), user)
