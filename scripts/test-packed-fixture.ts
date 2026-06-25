@@ -110,7 +110,7 @@ try {
   }
   await writeFile(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`)
 
-  run('corepack', ['pnpm', 'install', '--offline'], fixture)
+  run('corepack', ['pnpm', 'install', '--prefer-offline'], fixture)
   run('corepack', ['pnpm', 'typecheck'], fixture)
   run('corepack', ['pnpm', 'build'], fixture)
 
